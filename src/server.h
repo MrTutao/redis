@@ -489,6 +489,10 @@ typedef long long mstime_t; /* millisecond time type. */
 #define REDISMODULE_TYPE_ENCVER(id) (id & REDISMODULE_TYPE_ENCVER_MASK)
 #define REDISMODULE_TYPE_SIGN(id) ((id & ~((uint64_t)REDISMODULE_TYPE_ENCVER_MASK)) >>REDISMODULE_TYPE_ENCVER_BITS)
 
+/* Bit flags for moduleTypeAuxSaveFunc */
+#define REDISMODULE_AUX_BEFORE_RDB (1<<0)
+#define REDISMODULE_AUX_AFTER_RDB (1<<1)
+
 struct RedisModule;
 struct RedisModuleIO;
 struct RedisModuleDigest;
@@ -501,6 +505,8 @@ struct redisObject;
  * is deleted. */
 typedef void *(*moduleTypeLoadFunc)(struct RedisModuleIO *io, int encver);
 typedef void (*moduleTypeSaveFunc)(struct RedisModuleIO *io, void *value);
+typedef int (*moduleTypeAuxLoadFunc)(struct RedisModuleIO *rdb, int encver, int when);
+typedef void (*moduleTypeAuxSaveFunc)(struct RedisModuleIO *rdb, int when);
 typedef void (*moduleTypeRewriteFunc)(struct RedisModuleIO *io, struct redisObject *key, void *value);
 typedef void (*moduleTypeDigestFunc)(struct RedisModuleDigest *digest, void *value);
 typedef size_t (*moduleTypeMemUsageFunc)(const void *value);
@@ -517,6 +523,9 @@ typedef struct RedisModuleType {
     moduleTypeMemUsageFunc mem_usage;
     moduleTypeDigestFunc digest;
     moduleTypeFreeFunc free;
+    moduleTypeAuxLoadFunc aux_load;
+    moduleTypeAuxSaveFunc aux_save;
+    int aux_save_triggers;
     char name[10]; /* 9 bytes name + null term. Charset: A-Z a-z 0-9 _- */
 } moduleType;
 
@@ -551,16 +560,18 @@ typedef struct RedisModuleIO {
     int ver;            /* Module serialization version: 1 (old),
                          * 2 (current version with opcodes annotation). */
     struct RedisModuleCtx *ctx; /* Optional context, see RM_GetContextFromIO()*/
+    struct redisObject *key;    /* Optional name of key processed */
 } RedisModuleIO;
 
 /* Macro to initialize an IO context. Note that the 'ver' field is populated
  * inside rdb.c according to the version of the value to load. */
-#define moduleInitIOContext(iovar,mtype,rioptr) do { \
+#define moduleInitIOContext(iovar,mtype,rioptr,keyptr) do { \
     iovar.rio = rioptr; \
     iovar.type = mtype; \
     iovar.bytes = 0; \
     iovar.error = 0; \
     iovar.ver = 0; \
+    iovar.key = keyptr; \
     iovar.ctx = NULL; \
 } while(0);
 
@@ -1408,7 +1419,8 @@ size_t moduleCount(void);
 void moduleAcquireGIL(void);
 void moduleReleaseGIL(void);
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
-
+void moduleCallCommandFilters(client *c);
+ssize_t rdbSaveModulesAux(rio *rdb, int when);
 
 /* Utils */
 long long ustime(void);

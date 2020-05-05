@@ -1356,6 +1356,9 @@
 		<Unit filename="/Users/taotaotu/ProjectFromGIT/C/redis/src/release.c">
 			<Option target="redis"/>
 		</Unit>
+		<Unit filename="/Users/taotaotu/ProjectFromGIT/C/redis/src/release.h">
+			<Option target="redis"/>
+		</Unit>
 		<Unit filename="/Users/taotaotu/ProjectFromGIT/C/redis/src/replication.c">
 			<Option target="redis"/>
 		</Unit>

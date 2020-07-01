@@ -1797,7 +1797,14 @@ static void usage(void) {
     exit(1);
 }
 
-static int confirmWithYes(char *msg) {
+static int confirmWithYes(char *msg, int force) {
+    /* if force is true and --cluster-yes option is on,
+     * do not prompt for an answer */
+    if (force &&
+        (config.cluster_manager_command.flags & CLUSTER_MANAGER_CMD_FLAG_YES)) {
+        return 1;
+    }
+
     printf("%s (type 'yes' to accept): ", msg);
     fflush(stdout);
     char buf[4];
@@ -3416,6 +3423,7 @@ static redisReply *clusterManagerMigrateKeysInReply(clusterManagerNode *source,
     size_t *argv_len = NULL;
     int c = (replace ? 8 : 7);
     if (config.auth) c += 2;
+    if (config.user) c += 1;
     size_t argc = c + reply->elements;
     size_t i, offset = 6; // Keys Offset
     argv = zcalloc(argc * sizeof(char *));
@@ -3442,12 +3450,24 @@ static redisReply *clusterManagerMigrateKeysInReply(clusterManagerNode *source,
         offset++;
     }
     if (config.auth) {
-        argv[offset] = "AUTH";
-        argv_len[offset] = 4;
-        offset++;
-        argv[offset] = config.auth;
-        argv_len[offset] = strlen(config.auth);
-        offset++;
+        if (config.user) {
+            argv[offset] = "AUTH2";
+            argv_len[offset] = 5;
+            offset++;
+            argv[offset] = config.user;
+            argv_len[offset] = strlen(config.user);
+            offset++;
+            argv[offset] = config.auth;
+            argv_len[offset] = strlen(config.auth);
+            offset++;
+        } else {
+            argv[offset] = "AUTH";
+            argv_len[offset] = 4;
+            offset++;
+            argv[offset] = config.auth;
+            argv_len[offset] = strlen(config.auth);
+            offset++;
+        }
     }
     argv[offset] = "KEYS";
     argv_len[offset] = 4;
@@ -4472,12 +4492,16 @@ static int clusterManagerFixSlotsCoverage(char *all_slots) {
     }
     dictReleaseIterator(iter);
 
+    /* we want explicit manual confirmation from users for all the fix cases */
+    int force = 0;
+
     /*  Handle case "1": keys in no node. */
     if (listLength(none) > 0) {
         printf("The following uncovered slots have no keys "
                "across the cluster:\n");
         clusterManagerPrintSlotsList(none);
-        if (confirmWithYes("Fix these slots by covering with a random node?")){
+        if (confirmWithYes("Fix these slots by covering with a random node?",
+                           force)) {
             listIter li;
             listNode *ln;
             listRewind(none, &li);
@@ -4503,7 +4527,8 @@ static int clusterManagerFixSlotsCoverage(char *all_slots) {
     if (listLength(single) > 0) {
         printf("The following uncovered slots have keys in just one node:\n");
         clusterManagerPrintSlotsList(single);
-        if (confirmWithYes("Fix these slots by covering with those nodes?")){
+        if (confirmWithYes("Fix these slots by covering with those nodes?",
+                           force)) {
             listIter li;
             listNode *ln;
             listRewind(single, &li);
@@ -4535,7 +4560,7 @@ static int clusterManagerFixSlotsCoverage(char *all_slots) {
         printf("The following uncovered slots have keys in multiple nodes:\n");
         clusterManagerPrintSlotsList(multi);
         if (confirmWithYes("Fix these slots by moving keys "
-                           "into a single node?")) {
+                           "into a single node?", force)) {
             listIter li;
             listNode *ln;
             listRewind(multi, &li);
@@ -5498,7 +5523,8 @@ assign_replicas:
     }
     clusterManagerOptimizeAntiAffinity(ip_nodes, ip_count);
     clusterManagerShowNodes();
-    if (confirmWithYes("Can I set the above configuration?")) {
+    int force = 1;
+    if (confirmWithYes("Can I set the above configuration?", force)) {
         listRewind(cluster_manager.nodes, &li);
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *node = ln->value;

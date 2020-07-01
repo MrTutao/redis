@@ -65,12 +65,15 @@ set ::all_tests {
     unit/wait
     unit/pendingquerybuf
     unit/tls
+    unit/tracking
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0
 
 set ::host 127.0.0.1
-set ::port 21111
+set ::port 6379; # port for external server
+set ::baseport 21111; # initial port for spawned redis servers
+set ::portcount 8000; # we don't wanna use more than 10000 to avoid collision with cluster bus ports
 set ::traceleaks 0
 set ::valgrind 0
 set ::tls 0
@@ -193,6 +196,21 @@ proc redis_deferring_client {args} {
     return $client
 }
 
+proc redis_client {args} {
+    set level 0
+    if {[llength $args] > 0 && [string is integer [lindex $args 0]]} {
+        set level [lindex $args 0]
+        set args [lrange $args 1 end]
+    }
+
+    # create client that defers reading reply
+    set client [redis [srv $level "host"] [srv $level "port"] 0 $::tls]
+
+    # select the right db and read the response (OK)
+    $client select 9
+    return $client
+}
+
 # Provide easy access to INFO properties. Same semantic as "proc r".
 proc s {args} {
     set level 0
@@ -216,9 +234,6 @@ proc run_solo {name code} {
 }
 
 proc cleanup {} {
-    if {$::dont_clean} {
-        return
-    }
     if {!$::quiet} {puts -nonewline "Cleanup: may take some time... "}
     flush stdout
     catch {exec rm -rf {*}[glob tests/tmp/redis.conf.*]}
@@ -231,26 +246,26 @@ proc test_server_main {} {
     set tclsh [info nameofexecutable]
     # Open a listening socket, trying different ports in order to find a
     # non busy one.
-    set port [find_available_port 11111]
+    set clientport [find_available_port 11111 32]
     if {!$::quiet} {
-        puts "Starting test server at port $port"
+        puts "Starting test server at port $clientport"
     }
-    socket -server accept_test_clients  -myaddr 127.0.0.1 $port
+    socket -server accept_test_clients  -myaddr 127.0.0.1 $clientport
 
     # Start the client instances
     set ::clients_pids {}
     if {$::external} {
         set p [exec $tclsh [info script] {*}$::argv \
-            --client $port --port $::port &]
+            --client $clientport &]
         lappend ::clients_pids $p
     } else {
-        set start_port [expr {$::port+100}]
+        set start_port $::baseport
+        set port_count [expr {$::portcount / $::numclients}]
         for {set j 0} {$j < $::numclients} {incr j} {
-            set start_port [find_available_port $start_port]
             set p [exec $tclsh [info script] {*}$::argv \
-                --client $port --port $start_port &]
+                --client $clientport --baseport $start_port --portcount $port_count &]
             lappend ::clients_pids $p
-            incr start_port 10
+            incr start_port $port_count
         }
     }
 
@@ -456,11 +471,11 @@ proc the_end {} {
         foreach failed $::failed_tests {
             puts "*** $failed"
         }
-        cleanup
+        if {!$::dont_clean} cleanup
         exit 1
     } else {
         puts "\n[colorstr bold-white {\o/}] [colorstr bold-green {All tests passed without errors!}]\n"
-        cleanup
+        if {!$::dont_clean} cleanup
         exit 0
     }
 }
@@ -513,6 +528,10 @@ proc print_help_screen {} {
         "--loop             Execute the specified set of tests forever."
         "--wait-server      Wait after server is started (so that you can attach a debugger)."
         "--tls              Run tests in TLS mode."
+        "--host <addr>      Run tests against an external host."
+        "--port <port>      TCP port to use against external host."
+        "--baseport <port>  Initial port number for spawned redis servers."
+        "--portcount <num>  Port range for spawned redis servers."
         "--help             Print this help screen."
     } "\n"]
 }
@@ -562,6 +581,12 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         incr j
     } elseif {$opt eq {--port}} {
         set ::port $arg
+        incr j
+    } elseif {$opt eq {--baseport}} {
+        set ::baseport $arg
+        incr j
+    } elseif {$opt eq {--portcount}} {
+        set ::portcount $arg
         incr j
     } elseif {$opt eq {--accurate}} {
         set ::accurate 1

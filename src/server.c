@@ -326,6 +326,10 @@ struct redisCommand redisCommandTable[] = {
      "write @list",
      0,NULL,1,1,1,0,0,0},
 
+    {"lpos",lposCommand,-3,
+     "read-only @list",
+     0,NULL,1,1,1,0,0,0},
+
     {"lrem",lremCommand,4,
      "write @list",
      0,NULL,1,1,1,0,0,0},
@@ -776,11 +780,11 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,0,0,0,0,0,0},
 
     {"watch",watchCommand,-2,
-     "no-script fast @transaction",
+     "no-script fast ok-loading ok-stale @transaction",
      0,NULL,1,-1,1,0,0,0},
 
     {"unwatch",unwatchCommand,1,
-     "no-script fast @transaction",
+     "no-script fast ok-loading ok-stale @transaction",
      0,NULL,0,0,0,0,0,0},
 
     {"cluster",clusterCommand,-2,
@@ -2053,6 +2057,12 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* Stop the I/O threads if we don't have enough pending work. */
     stopThreadedIOIfNeeded();
 
+    /* Resize tracking keys table if needed. This is also done at every
+     * command execution, but we want to be sure that if the last command
+     * executed changes the value via CONFIG SET, the server will perform
+     * the operation even if completely idle. */
+    if (server.tracking_clients) trackingLimitUsedSlots();
+
     /* Start a scheduled BGSAVE if the corresponding flag is set. This is
      * useful when we are forced to postpone a BGSAVE because an AOF
      * rewrite is in progress.
@@ -2081,11 +2091,39 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     return 1000/server.hz;
 }
 
+extern int ProcessingEventsWhileBlocked;
+
 /* This function gets called every time Redis is entering the
  * main loop of the event driven library, that is, before to sleep
- * for ready file descriptors. */
+ * for ready file descriptors.
+ *
+ * Note: This function is (currently) called from two functions:
+ * 1. aeMain - The main server loop
+ * 2. processEventsWhileBlocked - Process clients during RDB/AOF load
+ *
+ * If it was called from processEventsWhileBlocked we don't want
+ * to perform all actions (For example, we don't want to expire
+ * keys), but we do need to perform some actions.
+ *
+ * The most important is freeClientsInAsyncFreeQueue but we also
+ * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
+
+    /* Just call a subset of vital functions in case we are re-entering
+     * the event loop from processEventsWhileBlocked(). Note that in this
+     * case we keep track of the number of events we are processing, since
+     * processEventsWhileBlocked() wants to stop ASAP if there are no longer
+     * events to handle. */
+    if (ProcessingEventsWhileBlocked) {
+        uint64_t processed = 0;
+        processed += handleClientsWithPendingReadsUsingThreads();
+        processed += tlsProcessPendingData();
+        processed += handleClientsWithPendingWrites();
+        processed += freeClientsInAsyncFreeQueue();
+        server.events_processed_while_blocked += processed;
+        return;
+    }
 
     /* Handle precise timeouts of blocked clients. */
     handleBlockedClientsTimeout();
@@ -2165,7 +2203,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
  * the different events callbacks. */
 void afterSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
-    if (moduleCount()) moduleAcquireGIL();
+
+    if (!ProcessingEventsWhileBlocked) {
+        if (moduleCount()) moduleAcquireGIL();
+    }
 }
 
 /* =========================== Server initialization ======================== */
@@ -2357,7 +2398,6 @@ void initServerConfig(void) {
     server.repl_syncio_timeout = CONFIG_REPL_SYNCIO_TIMEOUT;
     server.repl_down_since = 0; /* Never connected, repl is down since EVER. */
     server.master_repl_offset = 0;
-    server.master_repl_meaningful_offset = 0;
 
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
@@ -2731,6 +2771,7 @@ void initServer(void) {
     server.clients_waiting_acks = listCreate();
     server.get_ack_from_slaves = 0;
     server.clients_paused = 0;
+    server.events_processed_while_blocked = 0;
     server.system_memory_size = zmalloc_get_memory_size();
 
     if (server.tls_port && tlsConfigure(&server.tls_ctx_config) == C_ERR) {
@@ -2873,6 +2914,11 @@ void initServer(void) {
                 "blocked clients subsystem.");
     }
 
+    /* Register before and after sleep handlers (note this needs to be done
+     * before loading persistence since it is used by processEventsWhileBlocked. */
+    aeSetBeforeSleepProc(server.el,beforeSleep);
+    aeSetAfterSleepProc(server.el,afterSleep);
+
     /* Open the AOF file if needed. */
     if (server.aof_state == AOF_ON) {
         server.aof_fd = open(server.aof_filename,
@@ -2899,7 +2945,6 @@ void initServer(void) {
     scriptingInit(1);
     slowlogInit();
     latencyMonitorInit();
-    crc64_init();
 }
 
 /* Some steps in server initialization need to be done last (after modules
@@ -3205,8 +3250,8 @@ void call(client *c, int flags) {
 
     server.fixed_time_expire++;
 
-    /* Sent the command to clients in MONITOR mode, only if the commands are
-     * not generated from reading an AOF. */
+    /* Send the command to clients in MONITOR mode if applicable.
+     * Administrative commands are considered too dangerous to be shown. */
     if (listLength(server.monitors) &&
         !server.loading &&
         !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
@@ -3357,6 +3402,34 @@ void call(client *c, int flags) {
     server.stat_numcommands++;
 }
 
+/* Used when a command that is ready for execution needs to be rejected, due to
+ * varios pre-execution checks. it returns the appropriate error to the client.
+ * If there's a transaction is flags it as dirty, and if the command is EXEC,
+ * it aborts the transaction. */
+void rejectCommand(client *c, robj *reply) {
+    flagTransaction(c);
+    if (c->cmd && c->cmd->proc == execCommand) {
+        execCommandAbort(c, reply->ptr);
+    } else {
+        /* using addReplyError* rather than addReply so that the error can be logged. */
+        addReplyErrorSafe(c, reply->ptr, sdslen(reply->ptr));
+    }
+}
+
+void rejectCommandFormat(client *c, const char *fmt, ...) {
+    flagTransaction(c);
+    va_list ap;
+    va_start(ap,fmt);
+    sds s = sdscatvprintf(sdsempty(),fmt,ap);
+    va_end(ap);
+    if (c->cmd && c->cmd->proc == execCommand) {
+        execCommandAbort(c, s);
+    } else {
+        addReplyErrorSafe(c, s, sdslen(s));
+    }
+    sdsfree(s);
+}
+
 /* If this function gets called we already read a whole
  * command, arguments are in the client argv/argc fields.
  * processCommand() execute the command or prepare the
@@ -3382,22 +3455,29 @@ int processCommand(client *c) {
      * such as wrong arity, bad command name and so forth. */
     c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
     if (!c->cmd) {
-        flagTransaction(c);
         sds args = sdsempty();
         int i;
         for (i=1; i < c->argc && sdslen(args) < 128; i++)
             args = sdscatprintf(args, "`%.*s`, ", 128-(int)sdslen(args), (char*)c->argv[i]->ptr);
-        addReplyErrorFormat(c,"unknown command `%s`, with args beginning with: %s",
+        rejectCommandFormat(c,"unknown command `%s`, with args beginning with: %s",
             (char*)c->argv[0]->ptr, args);
         sdsfree(args);
         return C_OK;
     } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
                (c->argc < -c->cmd->arity)) {
-        flagTransaction(c);
-        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",
+        rejectCommandFormat(c,"wrong number of arguments for '%s' command",
             c->cmd->name);
         return C_OK;
     }
+
+    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
+    int is_denyoom_command = (c->cmd->flags & CMD_DENYOOM) ||
+                             (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_DENYOOM));
+    int is_denystale_command = !(c->cmd->flags & CMD_STALE) ||
+                               (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_STALE));
+    int is_denyloading_command = !(c->cmd->flags & CMD_LOADING) ||
+                                 (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_LOADING));
 
     /* Check if the user is authenticated. This check is skipped in case
      * the default user is flagged as "nopass" and is active. */
@@ -3408,8 +3488,7 @@ int processCommand(client *c) {
         /* AUTH and HELLO and no auth modules are valid even in
          * non-authenticated state. */
         if (!(c->cmd->flags & CMD_NO_AUTH)) {
-            flagTransaction(c);
-            addReply(c,shared.noautherr);
+            rejectCommand(c,shared.noautherr);
             return C_OK;
         }
     }
@@ -3420,13 +3499,12 @@ int processCommand(client *c) {
     int acl_retval = ACLCheckCommandPerm(c,&acl_keypos);
     if (acl_retval != ACL_OK) {
         addACLLogEntry(c,acl_retval,acl_keypos,NULL);
-        flagTransaction(c);
         if (acl_retval == ACL_DENIED_CMD)
-            addReplyErrorFormat(c,
+            rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to run "
                 "the '%s' command or its subcommand", c->cmd->name);
         else
-            addReplyErrorFormat(c,
+            rejectCommandFormat(c,
                 "-NOPERM this user has no permissions to access "
                 "one of the keys used as arguments");
         return C_OK;
@@ -3474,13 +3552,11 @@ int processCommand(client *c) {
          * is trying to execute is denied during OOM conditions or the client
          * is in MULTI/EXEC context? Error. */
         if (out_of_memory &&
-            (c->cmd->flags & CMD_DENYOOM ||
+            (is_denyoom_command ||
              (c->flags & CLIENT_MULTI &&
-              c->cmd->proc != execCommand &&
               c->cmd->proc != discardCommand)))
         {
-            flagTransaction(c);
-            addReply(c, shared.oomerr);
+            rejectCommand(c, shared.oomerr);
             return C_OK;
         }
 
@@ -3501,17 +3577,14 @@ int processCommand(client *c) {
     int deny_write_type = writeCommandsDeniedByDiskError();
     if (deny_write_type != DISK_ERROR_TYPE_NONE &&
         server.masterhost == NULL &&
-        (c->cmd->flags & CMD_WRITE ||
-         c->cmd->proc == pingCommand))
+        (is_write_command ||c->cmd->proc == pingCommand))
     {
-        flagTransaction(c);
         if (deny_write_type == DISK_ERROR_TYPE_RDB)
-            addReply(c, shared.bgsaveerr);
+            rejectCommand(c, shared.bgsaveerr);
         else
-            addReplySds(c,
-                sdscatprintf(sdsempty(),
+            rejectCommandFormat(c,
                 "-MISCONF Errors writing to the AOF file: %s\r\n",
-                strerror(server.aof_last_write_errno)));
+                strerror(server.aof_last_write_errno));
         return C_OK;
     }
 
@@ -3520,11 +3593,10 @@ int processCommand(client *c) {
     if (server.masterhost == NULL &&
         server.repl_min_slaves_to_write &&
         server.repl_min_slaves_max_lag &&
-        c->cmd->flags & CMD_WRITE &&
+        is_write_command &&
         server.repl_good_slaves_count < server.repl_min_slaves_to_write)
     {
-        flagTransaction(c);
-        addReply(c, shared.noreplicaserr);
+        rejectCommand(c, shared.noreplicaserr);
         return C_OK;
     }
 
@@ -3532,10 +3604,9 @@ int processCommand(client *c) {
      * accept write commands if this is our master. */
     if (server.masterhost && server.repl_slave_ro &&
         !(c->flags & CLIENT_MASTER) &&
-        c->cmd->flags & CMD_WRITE)
+        is_write_command)
     {
-        flagTransaction(c);
-        addReply(c, shared.roslaveerr);
+        rejectCommand(c, shared.roslaveerr);
         return C_OK;
     }
 
@@ -3547,7 +3618,7 @@ int processCommand(client *c) {
         c->cmd->proc != unsubscribeCommand &&
         c->cmd->proc != psubscribeCommand &&
         c->cmd->proc != punsubscribeCommand) {
-        addReplyErrorFormat(c,
+        rejectCommandFormat(c,
             "Can't execute '%s': only (P)SUBSCRIBE / "
             "(P)UNSUBSCRIBE / PING / QUIT are allowed in this context",
             c->cmd->name);
@@ -3559,17 +3630,16 @@ int processCommand(client *c) {
      * link with master. */
     if (server.masterhost && server.repl_state != REPL_STATE_CONNECTED &&
         server.repl_serve_stale_data == 0 &&
-        !(c->cmd->flags & CMD_STALE))
+        is_denystale_command)
     {
-        flagTransaction(c);
-        addReply(c, shared.masterdownerr);
+        rejectCommand(c, shared.masterdownerr);
         return C_OK;
     }
 
     /* Loading DB? Return an error if the command has not the
      * CMD_LOADING flag. */
-    if (server.loading && !(c->cmd->flags & CMD_LOADING)) {
-        addReply(c, shared.loadingerr);
+    if (server.loading && is_denyloading_command) {
+        rejectCommand(c, shared.loadingerr);
         return C_OK;
     }
 
@@ -3584,8 +3654,9 @@ int processCommand(client *c) {
           c->cmd->proc != helloCommand &&
           c->cmd->proc != replconfCommand &&
           c->cmd->proc != multiCommand &&
-          c->cmd->proc != execCommand &&
           c->cmd->proc != discardCommand &&
+          c->cmd->proc != watchCommand &&
+          c->cmd->proc != unwatchCommand &&
         !(c->cmd->proc == shutdownCommand &&
           c->argc == 2 &&
           tolower(((char*)c->argv[1]->ptr)[0]) == 'n') &&
@@ -3593,8 +3664,7 @@ int processCommand(client *c) {
           c->argc == 2 &&
           tolower(((char*)c->argv[1]->ptr)[0]) == 'k'))
     {
-        flagTransaction(c);
-        addReply(c, shared.slowscripterr);
+        rejectCommand(c, shared.slowscripterr);
         return C_OK;
     }
 
@@ -3633,6 +3703,15 @@ void closeListeningSockets(int unlink_unix_socket) {
 }
 
 int prepareForShutdown(int flags) {
+    /* When SHUTDOWN is called while the server is loading a dataset in
+     * memory we need to make sure no attempt is performed to save
+     * the dataset on shutdown (otherwise it could overwrite the current DB
+     * with half-read data).
+     *
+     * Also when in Sentinel mode clear the SAVE flag and force NOSAVE. */
+    if (server.loading || server.sentinel_mode)
+        flags = (flags & ~SHUTDOWN_SAVE) | SHUTDOWN_NOSAVE;
+
     int save = flags & SHUTDOWN_SAVE;
     int nosave = flags & SHUTDOWN_NOSAVE;
 
@@ -4429,7 +4508,6 @@ sds genRedisInfoString(const char *section) {
             "master_replid:%s\r\n"
             "master_replid2:%s\r\n"
             "master_repl_offset:%lld\r\n"
-            "master_repl_meaningful_offset:%lld\r\n"
             "second_repl_offset:%lld\r\n"
             "repl_backlog_active:%d\r\n"
             "repl_backlog_size:%lld\r\n"
@@ -4438,7 +4516,6 @@ sds genRedisInfoString(const char *section) {
             server.replid,
             server.replid2,
             server.master_repl_offset,
-            server.master_repl_meaningful_offset,
             server.second_replid_offset,
             server.repl_backlog != NULL,
             server.repl_backlog_size,
@@ -4816,7 +4893,6 @@ void loadDataFromDisk(void) {
             {
                 memcpy(server.replid,rsi.repl_id,sizeof(server.replid));
                 server.master_repl_offset = rsi.repl_offset;
-                server.master_repl_meaningful_offset = rsi.repl_offset;
                 /* If we are a slave, create a cached master from this
                  * information, in order to allow partial resynchronizations
                  * with masters. */
@@ -4963,6 +5039,7 @@ int main(int argc, char **argv) {
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
     srand(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
+    crc64_init();
 
     uint8_t hashseed[16];
     getRandomBytes(hashseed,sizeof(hashseed));
@@ -5129,8 +5206,6 @@ int main(int argc, char **argv) {
     }
 
     redisSetCpuAffinity(server.server_cpulist);
-    aeSetBeforeSleepProc(server.el,beforeSleep);
-    aeSetAfterSleepProc(server.el,afterSleep);
     aeMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;

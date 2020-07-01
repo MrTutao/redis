@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "atomicvar.h"
+#include "cluster.h"
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <math.h>
@@ -268,7 +269,7 @@ void _addReplyProtoToList(client *c, const char *s, size_t len) {
     clientReplyBlock *tail = ln? listNodeValue(ln): NULL;
 
     /* Note that 'tail' may be NULL even if we have a tail node, becuase when
-     * addDeferredMultiBulkLength() is used, it sets a dummy node to NULL just
+     * addReplyDeferredLen() is used, it sets a dummy node to NULL just
      * fo fill it later, when the size of the bulk length is set. */
 
     /* Append to tail string when possible. */
@@ -393,6 +394,11 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
         serverLog(LL_WARNING,"== CRITICAL == This %s is sending an error "
                              "to its %s: '%s' after processing the command "
                              "'%s'", from, to, s, cmdname);
+        if (ctype == CLIENT_TYPE_MASTER && server.repl_backlog &&
+            server.repl_backlog_histlen > 0)
+        {
+            showLatestBacklog();
+        }
         server.stat_unexpected_error_replies++;
     }
 }
@@ -401,19 +407,23 @@ void addReplyError(client *c, const char *err) {
     addReplyErrorLength(c,err,strlen(err));
 }
 
+/* See addReplyErrorLength.
+ * Makes sure there are no newlines in the string, otherwise invalid protocol
+ * is emitted. */
+void addReplyErrorSafe(client *c, char *s, size_t len) {
+    size_t j;
+    for (j = 0; j < len; j++) {
+        if (s[j] == '\r' || s[j] == '\n') s[j] = ' ';
+    }
+    addReplyErrorLength(c,s,sdslen(s));
+}
+
 void addReplyErrorFormat(client *c, const char *fmt, ...) {
-    size_t l, j;
     va_list ap;
     va_start(ap,fmt);
     sds s = sdscatvprintf(sdsempty(),fmt,ap);
     va_end(ap);
-    /* Make sure there are no newlines in the string, otherwise invalid protocol
-     * is emitted. */
-    l = sdslen(s);
-    for (j = 0; j < l; j++) {
-        if (s[j] == '\r' || s[j] == '\n') s[j] = ' ';
-    }
-    addReplyErrorLength(c,s,sdslen(s));
+    addReplyErrorSafe(c, s, sdslen(s));
     sdsfree(s);
 }
 
@@ -444,7 +454,7 @@ void trimReplyUnusedTailSpace(client *c) {
     clientReplyBlock *tail = ln? listNodeValue(ln): NULL;
 
     /* Note that 'tail' may be NULL even if we have a tail node, becuase when
-     * addDeferredMultiBulkLength() is used */
+     * addReplyDeferredLen() is used */
     if (!tail) return;
 
     /* We only try to trim the space is relatively high (more than a 1/4 of the
@@ -459,7 +469,7 @@ void trimReplyUnusedTailSpace(client *c) {
         /* take over the allocation's internal fragmentation (at least for
          * memory usage tracking) */
         tail->size = zmalloc_usable(tail) - sizeof(clientReplyBlock);
-        c->reply_bytes += tail->size - old_size;
+        c->reply_bytes = c->reply_bytes + tail->size - old_size;
         listNodeValue(ln) = tail;
     }
 }
@@ -887,17 +897,24 @@ static void acceptCommonHandler(connection *conn, int flags, char *ip) {
     client *c;
     UNUSED(ip);
 
-    /* Admission control will happen before a client is created and connAccept()
+    /* Limit the number of connections we take at the same time.
+     *
+     * Admission control will happen before a client is created and connAccept()
      * called, because we don't want to even start transport-level negotiation
-     * if rejected.
-     */
-    if (listLength(server.clients) >= server.maxclients) {
-        char *err = "-ERR max number of clients reached\r\n";
+     * if rejected. */
+    if (listLength(server.clients) + getClusterConnectionsCount()
+        >= server.maxclients)
+    {
+        char *err;
+        if (server.cluster_enabled)
+            err = "-ERR max number of clients reached\r\n";
+        else
+            err = "-ERR max number of clients + cluster "
+                  "connections reached\r\n";
 
         /* That's a best effort error message, don't check write errors.
-         * Note that for TLS connections, no handshake was done yet so nothing is written
-         * and the connection will just drop.
-         */
+         * Note that for TLS connections, no handshake was done yet so nothing
+         * is written and the connection will just drop. */
         if (connWrite(conn,err,strlen(err)) == -1) {
             /* Nothing to do, Just to avoid the warning... */
         }
@@ -1010,8 +1027,10 @@ static void freeClientArgv(client *c) {
  * when we resync with our own master and want to force all our slaves to
  * resync with us as well. */
 void disconnectSlaves(void) {
-    while (listLength(server.slaves)) {
-        listNode *ln = listFirst(server.slaves);
+    listIter li;
+    listNode *ln;
+    listRewind(server.slaves,&li);
+    while((ln = listNext(&li))) {
         freeClient((client*)ln->value);
     }
 }
@@ -1105,6 +1124,16 @@ void freeClient(client *c) {
     /* Notify module system that this client auth status changed. */
     moduleNotifyUserChanged(c);
 
+    /* If this client was scheduled for async freeing we need to remove it
+     * from the queue. Note that we need to do this here, because later
+     * we may call replicationCacheMaster() and the client should already
+     * be removed from the list of clients to free. */
+    if (c->flags & CLIENT_CLOSE_ASAP) {
+        ln = listSearchKey(server.clients_to_close,c);
+        serverAssert(ln != NULL);
+        listDelNode(server.clients_to_close,ln);
+    }
+
     /* If it is our master that's beging disconnected we should make sure
      * to cache the state to try a partial resynchronization later.
      *
@@ -1112,10 +1141,8 @@ void freeClient(client *c) {
      * some unexpected state, by checking its flags. */
     if (server.master && c->flags & CLIENT_MASTER) {
         serverLog(LL_WARNING,"Connection with master lost.");
-        if (!(c->flags & (CLIENT_CLOSE_AFTER_REPLY|
-                          CLIENT_CLOSE_ASAP|
-                          CLIENT_BLOCKED)))
-        {
+        if (!(c->flags & (CLIENT_PROTOCOL_ERROR|CLIENT_BLOCKED))) {
+            c->flags &= ~(CLIENT_CLOSE_ASAP|CLIENT_CLOSE_AFTER_REPLY);
             replicationCacheMaster(c);
             return;
         }
@@ -1183,15 +1210,7 @@ void freeClient(client *c) {
      * we lost the connection with the master. */
     if (c->flags & CLIENT_MASTER) replicationHandleMasterDisconnection();
 
-    /* If this client was scheduled for async freeing we need to remove it
-     * from the queue. */
-    if (c->flags & CLIENT_CLOSE_ASAP) {
-        ln = listSearchKey(server.clients_to_close,c);
-        serverAssert(ln != NULL);
-        listDelNode(server.clients_to_close,ln);
-    }
-
-    /* Remove the contribution that this client gave to our
+   /* Remove the contribution that this client gave to our
      * incrementally computed memory usage. */
     server.stat_clients_type_memory[c->client_cron_last_memory_type] -=
         c->client_cron_last_memory_usage;
@@ -1228,15 +1247,25 @@ void freeClientAsync(client *c) {
     pthread_mutex_unlock(&async_free_queue_mutex);
 }
 
-void freeClientsInAsyncFreeQueue(void) {
-    while (listLength(server.clients_to_close)) {
-        listNode *ln = listFirst(server.clients_to_close);
+/* Free the clietns marked as CLOSE_ASAP, return the number of clients
+ * freed. */
+int freeClientsInAsyncFreeQueue(void) {
+    int freed = 0;
+    listIter li;
+    listNode *ln;
+
+    listRewind(server.clients_to_close,&li);
+    while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
+
+        if (c->flags & CLIENT_PROTECTED) continue;
 
         c->flags &= ~CLIENT_CLOSE_ASAP;
         freeClient(c);
         listDelNode(server.clients_to_close,ln);
+        freed++;
     }
+    return freed;
 }
 
 /* Return a client by ID, or NULL if the client ID is not in the set
@@ -1506,6 +1535,19 @@ int processInlineBuffer(client *c) {
     if (querylen == 0 && getClientType(c) == CLIENT_TYPE_SLAVE)
         c->repl_ack_time = server.unixtime;
 
+    /* Masters should never send us inline protocol to run actual
+     * commands. If this happens, it is likely due to a bug in Redis where
+     * we got some desynchronization in the protocol, for example
+     * beause of a PSYNC gone bad.
+     *
+     * However the is an exception: masters may send us just a newline
+     * to keep the connection active. */
+    if (querylen != 0 && c->flags & CLIENT_MASTER) {
+        serverLog(LL_WARNING,"WARNING: Receiving inline protocol from master, master stream corruption? Closing the master connection and discarding the cached master.");
+        setProtocolError("Master using the inline protocol. Desync?",c);
+        return C_ERR;
+    }
+
     /* Move querybuffer position to the next query in the buffer. */
     c->qb_pos += querylen+linefeed_chars;
 
@@ -1525,10 +1567,11 @@ int processInlineBuffer(client *c) {
 }
 
 /* Helper function. Record protocol erro details in server log,
- * and set the client as CLIENT_CLOSE_AFTER_REPLY. */
+ * and set the client as CLIENT_CLOSE_AFTER_REPLY and
+ * CLIENT_PROTOCOL_ERROR. */
 #define PROTO_DUMP_LEN 128
 static void setProtocolError(const char *errstr, client *c) {
-    if (server.verbosity <= LL_VERBOSE) {
+    if (server.verbosity <= LL_VERBOSE || c->flags & CLIENT_MASTER) {
         sds client = catClientInfoString(sdsempty(),c);
 
         /* Sample some protocol to given an idea about what was inside. */
@@ -1547,11 +1590,13 @@ static void setProtocolError(const char *errstr, client *c) {
         }
 
         /* Log all the client and protocol info. */
-        serverLog(LL_VERBOSE,
+        int loglevel = (c->flags & CLIENT_MASTER) ? LL_WARNING :
+                                                    LL_VERBOSE;
+        serverLog(loglevel,
             "Protocol error (%s) from client: %s. %s", errstr, client, buf);
         sdsfree(client);
     }
-    c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+    c->flags |= (CLIENT_CLOSE_AFTER_REPLY|CLIENT_PROTOCOL_ERROR);
 }
 
 /* Process the query buffer for client 'c', setting up the client argument
@@ -1706,7 +1751,6 @@ int processMultibulkBuffer(client *c) {
  * 2. In the case of master clients, the replication offset is updated.
  * 3. Propagate commands we got from our master to replicas down the line. */
 void commandProcessed(client *c) {
-    int cmd_is_ping = c->cmd && c->cmd->proc == pingCommand;
     long long prev_offset = c->reploff;
     if (c->flags & CLIENT_MASTER && !(c->flags & CLIENT_MULTI)) {
         /* Update the applied replication offset of our master. */
@@ -1731,16 +1775,11 @@ void commandProcessed(client *c) {
      * sub-replicas and to the replication backlog. */
     if (c->flags & CLIENT_MASTER) {
         long long applied = c->reploff - prev_offset;
-        long long prev_master_repl_meaningful_offset = server.master_repl_meaningful_offset;
         if (applied) {
             replicationFeedSlavesFromMasterStream(server.slaves,
                     c->pending_querybuf, applied);
             sdsrange(c->pending_querybuf,applied,-1);
         }
-        /* The server.master_repl_meaningful_offset variable represents
-         * the offset of the replication stream without the pending PINGs. */
-        if (cmd_is_ping)
-            server.master_repl_meaningful_offset = prev_master_repl_meaningful_offset;
     }
 }
 
@@ -2500,7 +2539,7 @@ void helloCommand(client *c) {
     addReplyBulkCString(c,REDIS_VERSION);
 
     addReplyBulkCString(c,"proto");
-    addReplyLongLong(c,3);
+    addReplyLongLong(c,ver);
 
     addReplyBulkCString(c,"id");
     addReplyLongLong(c,c->id);
@@ -2823,9 +2862,8 @@ int clientsArePaused(void) {
  * write, close sequence needed to serve a client.
  *
  * The function returns the total number of events processed. */
-int processEventsWhileBlocked(void) {
+void processEventsWhileBlocked(void) {
     int iterations = 4; /* See the function top-comment. */
-    int count = 0;
 
     /* Note: when we are processing events while blocked (for instance during
      * busy Lua scripts), we set a global flag. When such flag is set, we
@@ -2833,14 +2871,17 @@ int processEventsWhileBlocked(void) {
      * See https://github.com/antirez/redis/issues/6988 for more info. */
     ProcessingEventsWhileBlocked = 1;
     while (iterations--) {
-        int events = 0;
-        events += aeProcessEvents(server.el, AE_FILE_EVENTS|AE_DONT_WAIT);
-        events += handleClientsWithPendingWrites();
+        long long startval = server.events_processed_while_blocked;
+        long long ae_events = aeProcessEvents(server.el,
+            AE_FILE_EVENTS|AE_DONT_WAIT|
+            AE_CALL_BEFORE_SLEEP|AE_CALL_AFTER_SLEEP);
+        /* Note that server.events_processed_while_blocked will also get
+         * incremeted by callbacks called by the event loop handlers. */
+        server.events_processed_while_blocked += ae_events;
+        long long events = server.events_processed_while_blocked - startval;
         if (!events) break;
-        count += events;
     }
     ProcessingEventsWhileBlocked = 0;
-    return count;
 }
 
 /* ==========================================================================

@@ -245,7 +245,7 @@ int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) {
     return 0; /* not found */
 }
 
-/* Update the score of an elmenent inside the sorted set skiplist.
+/* Update the score of an element inside the sorted set skiplist.
  * Note that the element must exist and must match 'score'.
  * This function does not update the score in the hash table side, the
  * caller should take care of it.
@@ -1283,6 +1283,10 @@ int zsetScore(robj *zobj, sds member, double *score) {
  *            assume 0 as previous score.
  * ZADD_NX:   Perform the operation only if the element does not exist.
  * ZADD_XX:   Perform the operation only if the element already exist.
+ * ZADD_GT:   Perform the operation on existing elements only if the new score is 
+ *            greater than the current score.
+ * ZADD_LT:   Perform the operation on existing elements only if the new score is 
+ *            less than the current score.
  *
  * When ZADD_INCR is used, the new score of the element is stored in
  * '*newscore' if 'newscore' is not NULL.
@@ -1317,6 +1321,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     int incr = (*flags & ZADD_INCR) != 0;
     int nx = (*flags & ZADD_NX) != 0;
     int xx = (*flags & ZADD_XX) != 0;
+    int gt = (*flags & ZADD_GT) != 0;
+    int lt = (*flags & ZADD_LT) != 0;
     *flags = 0; /* We'll return our response flags. */
     double curscore;
 
@@ -1348,7 +1354,12 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
 
             /* Remove and re-insert when score changed. */
-            if (score != curscore) {
+            if (score != curscore &&  
+                /* LT? Only update if score is less than current. */
+                (!lt || score < curscore) &&
+                /* GT? Only update if score is greater than current. */
+                (!gt || score > curscore)) 
+            {
                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
                 zobj->ptr = zzlInsert(zobj->ptr,ele,score);
                 *flags |= ZADD_UPDATED;
@@ -1393,7 +1404,12 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
 
             /* Remove and re-insert when score changes. */
-            if (score != curscore) {
+            if (score != curscore &&  
+                /* LT? Only update if score is less than current. */
+                (!lt || score < curscore) &&
+                /* GT? Only update if score is greater than current. */
+                (!gt || score > curscore)) 
+            {
                 znode = zslUpdateScore(zs->zsl,curscore,ele,score);
                 /* Note that we did not removed the original element from
                  * the hash table representing the sorted set, so we just
@@ -1555,6 +1571,8 @@ void zaddGenericCommand(client *c, int flags) {
         else if (!strcasecmp(opt,"xx")) flags |= ZADD_XX;
         else if (!strcasecmp(opt,"ch")) flags |= ZADD_CH;
         else if (!strcasecmp(opt,"incr")) flags |= ZADD_INCR;
+        else if (!strcasecmp(opt,"gt")) flags |= ZADD_GT;
+        else if (!strcasecmp(opt,"lt")) flags |= ZADD_LT;
         else break;
         scoreidx++;
     }
@@ -1564,6 +1582,8 @@ void zaddGenericCommand(client *c, int flags) {
     int nx = (flags & ZADD_NX) != 0;
     int xx = (flags & ZADD_XX) != 0;
     int ch = (flags & ZADD_CH) != 0;
+    int gt = (flags & ZADD_GT) != 0;
+    int lt = (flags & ZADD_LT) != 0;
 
     /* After the options, we expect to have an even number of args, since
      * we expect any number of score-element pairs. */
@@ -1580,6 +1600,13 @@ void zaddGenericCommand(client *c, int flags) {
             "XX and NX options at the same time are not compatible");
         return;
     }
+    
+    if ((gt && nx) || (lt && nx) || (gt && lt)) {
+        addReplyError(c,
+            "GT, LT, and/or NX options at the same time are not compatible");
+        return;
+    }
+    /* Note that XX is compatible with either GT or LT */
 
     if (incr && elements > 1) {
         addReplyError(c,
@@ -1598,6 +1625,7 @@ void zaddGenericCommand(client *c, int flags) {
 
     /* Lookup the key and create the sorted set if does not exist. */
     zobj = lookupKeyWrite(c->db,key);
+    if (checkType(c,zobj,OBJ_ZSET)) goto cleanup;
     if (zobj == NULL) {
         if (xx) goto reply_to_client; /* No key + XX option: nothing to do. */
         if (server.zset_max_ziplist_entries == 0 ||
@@ -1608,11 +1636,6 @@ void zaddGenericCommand(client *c, int flags) {
             zobj = createZsetZiplistObject();
         }
         dbAdd(c->db,key,zobj);
-    } else {
-        if (zobj->type != OBJ_ZSET) {
-            addReply(c,shared.wrongtypeerr);
-            goto cleanup;
-        }
     }
 
     for (j = 0; j < elements; j++) {
@@ -2173,7 +2196,15 @@ dictType setAccumulatorDictType = {
     NULL                       /* val destructor */
 };
 
-void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
+/* The zunionInterGenericCommand() function is called in order to implement the
+ * following commands: ZUNION, ZINTER, ZUNIONSTORE, ZINTERSTORE.
+ *
+ * 'numkeysIndex' parameter position of key number. for ZUNION/ZINTER command, this
+ * value is 1, for ZUNIONSTORE/ZINTERSTORE command, this value is 2.
+ *
+ * 'op' SET_OP_INTER or SET_OP_UNION.
+ */
+void zunionInterGenericCommand(client *c, robj *dstkey, int numkeysIndex, int op) {
     int i, j;
     long setnum;
     int aggregate = REDIS_AGGR_SUM;
@@ -2184,10 +2215,10 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     robj *dstobj;
     zset *dstzset;
     zskiplistNode *znode;
-    int touched = 0;
+    int withscores = 0;
 
     /* expect setnum input keys to be given */
-    if ((getLongFromObjectOrReply(c, c->argv[2], &setnum, NULL) != C_OK))
+    if ((getLongFromObjectOrReply(c, c->argv[numkeysIndex], &setnum, NULL) != C_OK))
         return;
 
     if (setnum < 1) {
@@ -2197,14 +2228,14 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     }
 
     /* test if the expected number of keys would overflow */
-    if (setnum > c->argc-3) {
+    if (setnum > (c->argc-(numkeysIndex+1))) {
         addReply(c,shared.syntaxerr);
         return;
     }
 
     /* read keys to be used for input */
     src = zcalloc(sizeof(zsetopsrc) * setnum);
-    for (i = 0, j = 3; i < setnum; i++, j++) {
+    for (i = 0, j = numkeysIndex+1; i < setnum; i++, j++) {
         robj *obj = lookupKeyWrite(c->db,c->argv[j]);
         if (obj != NULL) {
             if (obj->type != OBJ_ZSET && obj->type != OBJ_SET) {
@@ -2257,6 +2288,11 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
                     return;
                 }
                 j++; remaining--;
+            } else if (remaining >= 1 &&
+                       !strcasecmp(c->argv[j]->ptr,"withscores"))
+            {
+                j++; remaining--;
+                withscores = 1;
             } else {
                 zfree(src);
                 addReply(c,shared.syntaxerr);
@@ -2377,35 +2413,57 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
         serverPanic("Unknown operator");
     }
 
-    if (dbDelete(c->db,dstkey))
-        touched = 1;
-    if (dstzset->zsl->length) {
-        zsetConvertToZiplistIfNeeded(dstobj,maxelelen);
-        dbAdd(c->db,dstkey,dstobj);
-        addReplyLongLong(c,zsetLength(dstobj));
-        signalModifiedKey(c,c->db,dstkey);
-        notifyKeyspaceEvent(NOTIFY_ZSET,
-            (op == SET_OP_UNION) ? "zunionstore" : "zinterstore",
-            dstkey,c->db->id);
-        server.dirty++;
-    } else {
-        decrRefCount(dstobj);
-        addReply(c,shared.czero);
-        if (touched) {
-            signalModifiedKey(c,c->db,dstkey);
-            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
+    if (dstkey) {
+        if (dstzset->zsl->length) {
+            zsetConvertToZiplistIfNeeded(dstobj, maxelelen);
+            setKey(c, c->db, dstkey, dstobj);
+            addReplyLongLong(c, zsetLength(dstobj));
+            notifyKeyspaceEvent(NOTIFY_ZSET,
+                                (op == SET_OP_UNION) ? "zunionstore" : "zinterstore",
+                                dstkey, c->db->id);
             server.dirty++;
+        } else {
+            addReply(c, shared.czero);
+            if (dbDelete(c->db, dstkey)) {
+                signalModifiedKey(c, c->db, dstkey);
+                notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
+                server.dirty++;
+            }
+        }
+    } else {
+        unsigned long length = dstzset->zsl->length;
+        zskiplist *zsl = dstzset->zsl;
+        zskiplistNode *zn = zsl->header->level[0].forward;
+        if (withscores && c->resp == 2)
+            addReplyArrayLen(c, length*2);
+        else
+            addReplyArrayLen(c, length);
+
+        while (zn != NULL) {
+            if (withscores && c->resp > 2) addReplyArrayLen(c,2);
+            addReplyBulkCBuffer(c,zn->ele,sdslen(zn->ele));
+            if (withscores) addReplyDouble(c,zn->score);
+            zn = zn->level[0].forward;
         }
     }
+    decrRefCount(dstobj);
     zfree(src);
 }
 
 void zunionstoreCommand(client *c) {
-    zunionInterGenericCommand(c,c->argv[1], SET_OP_UNION);
+    zunionInterGenericCommand(c, c->argv[1], 2, SET_OP_UNION);
 }
 
 void zinterstoreCommand(client *c) {
-    zunionInterGenericCommand(c,c->argv[1], SET_OP_INTER);
+    zunionInterGenericCommand(c, c->argv[1], 2, SET_OP_INTER);
+}
+
+void zunionCommand(client *c) {
+    zunionInterGenericCommand(c, NULL, 1, SET_OP_UNION);
+}
+
+void zinterCommand(client *c) {
+    zunionInterGenericCommand(c, NULL, 1, SET_OP_INTER);
 }
 
 void zrangeGenericCommand(client *c, int reverse) {
@@ -3086,6 +3144,24 @@ void zscoreCommand(client *c) {
     }
 }
 
+void zmscoreCommand(client *c) {
+    robj *key = c->argv[1];
+    robj *zobj;
+    double score;
+    zobj = lookupKeyRead(c->db,key);
+    if (checkType(c,zobj,OBJ_ZSET)) return;
+
+    addReplyArrayLen(c,c->argc - 2);
+    for (int j = 2; j < c->argc; j++) {
+        /* Treat a missing set the same way as an empty set */
+        if (zobj == NULL || zsetScore(zobj,c->argv[j]->ptr,&score) == C_ERR) {
+            addReplyNull(c);
+        } else {
+            addReplyDouble(c,score);
+        }
+    }
+}
+
 void zrankGenericCommand(client *c, int reverse) {
     robj *key = c->argv[1];
     robj *ele = c->argv[2];
@@ -3266,20 +3342,16 @@ void blockingGenericZpopCommand(client *c, int where) {
 
     for (j = 1; j < c->argc-1; j++) {
         o = lookupKeyWrite(c->db,c->argv[j]);
+        if (checkType(c,o,OBJ_ZSET)) return;
         if (o != NULL) {
-            if (o->type != OBJ_ZSET) {
-                addReply(c,shared.wrongtypeerr);
+            if (zsetLength(o) != 0) {
+                /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
+                genericZpopCommand(c,&c->argv[j],1,where,1,NULL);
+                /* Replicate it as an ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
+                rewriteClientCommandVector(c,2,
+                    where == ZSET_MAX ? shared.zpopmax : shared.zpopmin,
+                    c->argv[j]);
                 return;
-            } else {
-                if (zsetLength(o) != 0) {
-                    /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
-                    genericZpopCommand(c,&c->argv[j],1,where,1,NULL);
-                    /* Replicate it as an ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
-                    rewriteClientCommandVector(c,2,
-                        where == ZSET_MAX ? shared.zpopmax : shared.zpopmin,
-                        c->argv[j]);
-                    return;
-                }
             }
         }
     }
@@ -3292,7 +3364,7 @@ void blockingGenericZpopCommand(client *c, int where) {
     }
 
     /* If the keys do not exist we must block */
-    blockForKeys(c,BLOCKED_ZSET,c->argv + 1,c->argc - 2,timeout,NULL,NULL);
+    blockForKeys(c,BLOCKED_ZSET,c->argv + 1,c->argc - 2,timeout,NULL,NULL,NULL);
 }
 
 // BZPOPMIN key [key ...] timeout

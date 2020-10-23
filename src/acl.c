@@ -53,6 +53,10 @@ list *UsersToLoad;  /* This is a list of users found in the configuration file
 list *ACLLog;       /* Our security log, the user is able to inspect that
                        using the ACL LOG command .*/
 
+static rax *commandId = NULL; /* Command name to id mapping */
+
+static unsigned long nextid = 0; /* Next command id that has not been assigned */
+
 struct ACLCategoryItem {
     const char *name;
     uint64_t flag;
@@ -289,7 +293,7 @@ void ACLFreeUserAndKillClients(user *u) {
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
         if (c->user == u) {
-            /* We'll free the conenction asynchronously, so
+            /* We'll free the connection asynchronously, so
              * in theory to set a different user is not needed.
              * However if there are bugs in Redis, soon or later
              * this may result in some security hole: it's much
@@ -297,7 +301,13 @@ void ACLFreeUserAndKillClients(user *u) {
              * it in non authenticated mode. */
             c->user = DefaultUser;
             c->authenticated = 0;
-            freeClientAsync(c);
+            /* We will write replies to this client later, so we can't
+             * close it directly even if async. */
+            if (c == server.current_client) {
+                c->flags |= CLIENT_CLOSE_AFTER_COMMAND;
+            } else {
+                freeClientAsync(c);
+            }
         }
     }
     ACLFreeUser(u);
@@ -472,17 +482,30 @@ sds ACLDescribeUserCommandRules(user *u) {
     /* Try to add or subtract each category one after the other. Often a
      * single category will not perfectly match the set of commands into
      * it, so at the end we do a final pass adding/removing the single commands
-     * needed to make the bitmap exactly match. */
+     * needed to make the bitmap exactly match. A temp user is maintained to
+     * keep track of categories already applied. */
+    user tu = {0};
+    user *tempuser = &tu;
+    memcpy(tempuser->allowed_commands,
+        u->allowed_commands, 
+        sizeof(u->allowed_commands));
+
     for (int j = 0; ACLCommandCategories[j].flag != 0; j++) {
         unsigned long on, off;
-        ACLCountCategoryBitsForUser(u,&on,&off,ACLCommandCategories[j].name);
+        ACLCountCategoryBitsForUser(tempuser,&on,&off,ACLCommandCategories[j].name);
         if ((additive && on > off) || (!additive && off > on)) {
             sds op = sdsnewlen(additive ? "+@" : "-@", 2);
             op = sdscat(op,ACLCommandCategories[j].name);
             ACLSetUser(fakeuser,op,-1);
+
+            sds invop = sdsnewlen(additive ? "-@" : "+@", 2);
+            invop = sdscat(invop,ACLCommandCategories[j].name);
+            ACLSetUser(tempuser,invop,-1);
+
             rules = sdscatsds(rules,op);
             rules = sdscatlen(rules," ",1);
             sdsfree(op);
+            sdsfree(invop);
         }
     }
 
@@ -1012,18 +1035,16 @@ int ACLAuthenticateUser(client *c, robj *username, robj *password) {
  * command name, so that a command retains the same ID in case of modules that
  * are unloaded and later reloaded. */
 unsigned long ACLGetCommandID(const char *cmdname) {
-    static rax *map = NULL;
-    static unsigned long nextid = 0;
 
     sds lowername = sdsnew(cmdname);
     sdstolower(lowername);
-    if (map == NULL) map = raxNew();
-    void *id = raxFind(map,(unsigned char*)lowername,sdslen(lowername));
+    if (commandId == NULL) commandId = raxNew();
+    void *id = raxFind(commandId,(unsigned char*)lowername,sdslen(lowername));
     if (id != raxNotFound) {
         sdsfree(lowername);
         return (unsigned long)id;
     }
-    raxInsert(map,(unsigned char*)lowername,strlen(lowername),
+    raxInsert(commandId,(unsigned char*)lowername,strlen(lowername),
               (void*)nextid,NULL);
     sdsfree(lowername);
     unsigned long thisid = nextid;
@@ -1039,6 +1060,13 @@ unsigned long ACLGetCommandID(const char *cmdname) {
      * with ACL SAVE. */
     if (nextid == USER_COMMAND_BITS_COUNT-1) nextid++;
     return thisid;
+}
+
+/* Clear command id table and reset nextid to 0. */
+void ACLClearCommandID(void) {
+    if (commandId) raxFree(commandId);
+    commandId = NULL;
+    nextid = 0;
 }
 
 /* Return an username by its name, or NULL if the user does not exist. */
@@ -1096,8 +1124,9 @@ int ACLCheckCommandPerm(client *c, int *keyidxptr) {
     if (!(c->user->flags & USER_FLAG_ALLKEYS) &&
         (c->cmd->getkeys_proc || c->cmd->firstkey))
     {
-        int numkeys;
-        int *keyidx = getKeysFromCommand(c->cmd,c->argv,c->argc,&numkeys);
+        getKeysResult result = GETKEYS_RESULT_INIT;
+        int numkeys = getKeysFromCommand(c->cmd,c->argv,c->argc,&result);
+        int *keyidx = result.keys;
         for (int j = 0; j < numkeys; j++) {
             listIter li;
             listNode *ln;
@@ -1118,11 +1147,11 @@ int ACLCheckCommandPerm(client *c, int *keyidxptr) {
             }
             if (!match) {
                 if (keyidxptr) *keyidxptr = keyidx[j];
-                getKeysFreeResult(keyidx);
+                getKeysFreeResult(&result);
                 return ACL_DENIED_KEY;
             }
         }
-        getKeysFreeResult(keyidx);
+        getKeysFreeResult(&result);
     }
 
     /* If we survived all the above checks, the user can execute the
@@ -1327,6 +1356,7 @@ sds ACLLoadFromFile(const char *filename) {
             errors = sdscatprintf(errors,
                      "'%s:%d: username '%s' contains invalid characters. ",
                      server.acl_filename, linenum, argv[1]);
+            sdsfreesplitres(argv,argc);
             continue;
         }
 
@@ -1911,7 +1941,7 @@ void aclCommand(client *c) {
             addReplyBulkCString(c,"client-info");
             addReplyBulkCBuffer(c,le->cinfo,sdslen(le->cinfo));
         }
-    } else if (!strcasecmp(sub,"help")) {
+    } else if (c->argc == 2 && !strcasecmp(sub,"help")) {
         const char *help[] = {
 "LOAD                             -- Reload users from the ACL file.",
 "SAVE                             -- Save the current config to the ACL file.",
@@ -1980,7 +2010,7 @@ void authCommand(client *c) {
     if (ACLAuthenticateUser(c,username,password) == C_OK) {
         addReply(c,shared.ok);
     } else {
-        addReplyError(c,"-WRONGPASS invalid username-password pair");
+        addReplyError(c,"-WRONGPASS invalid username-password pair or user is disabled.");
     }
 
     /* Free the "default" string object we created for the two
